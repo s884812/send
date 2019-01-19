@@ -25,6 +25,18 @@ export default class User {
     this.storage.user = data;
   }
 
+  get firstAction() {
+    return this.storage.get('firstAction');
+  }
+
+  set firstAction(action) {
+    this.storage.set('firstAction', action);
+  }
+
+  get id() {
+    return this.info.uid; //TODO
+  }
+
   get avatar() {
     const defaultAvatar = assets.get('user.svg');
     if (this.info.avatarDefault) {

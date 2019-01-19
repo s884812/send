@@ -1,4 +1,4 @@
-/* global DEFAULTS LIMITS */
+/* global LIMITS */
 import FileSender from './fileSender';
 import FileReceiver from './fileReceiver';
 import { copyToClipboard, delay, openLinksInNewTab, percent } from './utils';
@@ -50,18 +50,8 @@ export default function(state, emitter) {
 
   emitter.on('logout', () => {
     state.user.logout();
-    state.timeLimit = DEFAULTS.EXPIRE_SECONDS;
-    state.downloadCount = 1;
+    metrics.loggedOut();
     emitter.emit('pushState', '/');
-  });
-
-  emitter.on('changeLimit', async ({ file, value }) => {
-    const ok = await file.changeLimit(value, state.user);
-    if (!ok) {
-      return;
-    }
-    state.storage.writeFile(file);
-    metrics.changedDownloadLimit(file);
   });
 
   emitter.on('removeUpload', file => {
@@ -69,18 +59,18 @@ export default function(state, emitter) {
     render();
   });
 
-  emitter.on('delete', async ({ file, location }) => {
+  emitter.on('delete', async ownedFile => {
     try {
       metrics.deletedUpload({
-        size: file.size,
-        time: file.time,
-        speed: file.speed,
-        type: file.type,
-        ttl: file.expiresAt - Date.now(),
+        size: ownedFile.size,
+        time: ownedFile.time,
+        speed: ownedFile.speed,
+        type: ownedFile.type,
+        ttl: ownedFile.expiresAt - Date.now(),
         location
       });
-      state.storage.remove(file.id);
-      await file.del();
+      state.storage.remove(ownedFile.id);
+      await ownedFile.del();
     } catch (e) {
       state.raven.captureException(e);
     }
@@ -100,20 +90,37 @@ export default function(state, emitter) {
       state.archive.addFiles(files, maxSize);
     } catch (e) {
       if (e.message === 'fileTooBig' && maxSize < LIMITS.MAX_FILE_SIZE) {
-        state.modal = signupDialog();
-      } else {
-        state.modal = okDialog(
-          state.translate(e.message, {
-            size: bytes(maxSize),
-            count: LIMITS.MAX_FILES_PER_ARCHIVE
-          })
-        );
+        return emitter.emit('signup-cta', 'size');
       }
+      state.modal = okDialog(
+        state.translate(e.message, {
+          size: bytes(maxSize),
+          count: LIMITS.MAX_FILES_PER_ARCHIVE
+        })
+      );
     }
     render();
   });
 
-  emitter.on('upload', async ({ type, dlimit, password }) => {
+  emitter.on('signup-cta', source => {
+    metrics.triggeredSignup({ source });
+    state.modal = signupDialog(source);
+    render();
+  });
+
+  emitter.on('authenticate', async (code, oauthState) => {
+    try {
+      await state.user.finishLogin(code, oauthState);
+      await state.user.syncFileList();
+      metrics.signedIn();
+      emitter.emit('replaceState', '/');
+    } catch (e) {
+      emitter.emit('replaceState', '/error');
+      setTimeout(render);
+    }
+  });
+
+  emitter.on('upload', async ({ type }) => {
     if (state.storage.files.length >= LIMITS.MAX_ARCHIVES_PER_USER) {
       state.modal = okDialog(
         state.translate('tooManyArchives', {
@@ -122,8 +129,7 @@ export default function(state, emitter) {
       );
       return render();
     }
-    const size = state.archive.size;
-    if (!state.timeLimit) state.timeLimit = DEFAULTS.EXPIRE_SECONDS;
+    const archive = state.archive;
     const sender = new FileSender();
 
     sender.on('progress', updateProgress);
@@ -136,40 +142,37 @@ export default function(state, emitter) {
     const links = openLinksInNewTab();
     await delay(200);
     try {
-      metrics.startedUpload({ size, type });
+      metrics.startedUpload(archive);
 
-      const ownedFile = await sender.upload(
-        state.archive,
-        state.timeLimit,
-        dlimit,
-        state.user.bearerToken
-      );
+      const ownedFile = await sender.upload(archive, state.user.bearerToken);
       ownedFile.type = type;
       state.storage.totalUploads += 1;
-      metrics.completedUpload(ownedFile);
+      metrics.completedUpload(archive);
 
       state.storage.addFile(ownedFile);
       // TODO integrate password into /upload request
-      if (password) {
-        emitter.emit('password', { password, file: ownedFile });
+      if (archive.password) {
+        emitter.emit('password', {
+          password: archive.password,
+          file: ownedFile
+        });
       }
       state.modal = copyDialog(ownedFile.name, ownedFile.url);
     } catch (err) {
       if (err.message === '0') {
         //cancelled. do nothing
-        metrics.cancelledUpload({ size, type });
+        metrics.cancelledUpload(archive);
         render();
       } else {
         // eslint-disable-next-line no-console
         console.error(err);
         state.raven.captureException(err);
-        metrics.stoppedUpload({ size, type, err });
+        metrics.stoppedUpload({ archive, err });
         emitter.emit('pushState', '/error');
       }
     } finally {
       openLinksInNewTab(links, false);
-      state.archive.clear();
-      state.password = '';
+      archive.clear();
       state.uploading = false;
       state.transfer = null;
       await state.user.syncFileList();
@@ -183,7 +186,6 @@ export default function(state, emitter) {
       render();
       await file.setPassword(password);
       state.storage.writeFile(file);
-      metrics.addedPassword({ size: file.size });
       await delay(1000);
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -231,7 +233,7 @@ export default function(state, emitter) {
       const time = Date.now() - start;
       const speed = size / (time / 1000);
       state.storage.totalDownloads += 1;
-      metrics.completedDownload({ size, time, speed });
+      metrics.completedDownload({ size, speed });
     } catch (err) {
       if (err.message === '0') {
         // download cancelled
